@@ -5,7 +5,7 @@ import { httpGet, httpGetWithStreamCheck } from "../utils/http-util.js";
 import { parseDanmakuBase64, md5, convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
-import { titleMatches } from "../utils/common-util.js";
+import { titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 import { simplized } from "../utils/zh-util.js";
 import { getTmdbJaOriginalTitle, smartTitleReplace } from "../utils/tmdb-util.js";
@@ -355,37 +355,73 @@ export default class BilibiliSource extends BaseSource {
       // 处理本地遗珠：补全网络搜索未覆盖的本地条目
       const missingLocalMatches = localMatches.filter(m => !consumedLocalMdIds.has(`md${m.siteId}`));
       if (missingLocalMatches.length > 0) {
-          log("info", `[Bilibili] 从本地 Bangumi-Data 补充 ${missingLocalMatches.length} 条缺漏记录并请求详情...`);
+          // 按是否携带 season_id 分流：本地已有时直接用 season_id 构建，无需请求 md→season_id 转换接口
+          const missingWithSeason = missingLocalMatches.filter(m => m.season_id);
+          const missingWithoutSeason = missingLocalMatches.filter(m => !m.season_id);
 
-          const missingPromises = missingLocalMatches.map(async (m) => {
-              const mediaInfo = await this._resolveMediaInfo(m.siteId);
-              const displayTitle = m.titles.find(t => t && t.includes(keyword)) || m.titles[1] || m.title;
-              const finalTitle = displayTitle + (m.titleSuffix || '');
+          if (missingWithSeason.length > 0) {
+              log("info", `[Bilibili] 从本地 Bangumi-Data 补充 ${missingWithSeason.length} 条缺漏记录并请求详情....（包含 season_id ）`);
 
-              return {
-                provider: "bilibili",
-                mediaId: mediaInfo.seasonId || `md${m.siteId}`,
-                mdId: `md${m.siteId}`,
-                title: finalTitle,
-                org_title: m.title,
-                aliases: [...m.titles],
-                _displayTitle: finalTitle,
-                type: m.typeStr,
-                year: m.begin ? parseInt(m.begin.substring(0, 4)) : null,
-                imageUrl: mediaInfo.cover,
-                episodeCount: 0,
-                isOversea: ['bilibili_hk_mo_tw', 'bilibili_hk_mo', 'bilibili_tw'].includes(m.matchedSiteKey),
-                isLocalPriority: true
-              };
-          });
+              for (const m of missingWithSeason) {
+                  const displayTitle = m.titles.find(t => t && t.includes(keyword)) || m.titles[1] || m.title;
+                  const finalTitle = displayTitle + (m.titleSuffix || '');
+                  const item = {
+                    provider: "bilibili",
+                    mediaId: `ss${m.season_id}`,
+                    mdId: `md${m.siteId}`,
+                    title: finalTitle,
+                    org_title: m.title,
+                    aliases: [...m.titles],
+                    _displayTitle: finalTitle,
+                    type: m.typeStr,
+                    year: m.begin ? parseInt(m.begin.substring(0, 4)) : null,
+                    imageUrl: "",
+                    episodeCount: 0,
+                    isOversea: ['bilibili_hk_mo_tw', 'bilibili_hk_mo', 'bilibili_tw'].includes(m.matchedSiteKey),
+                    isLocalPriority: true
+                  };
+                  const idKey = item.mediaId;
+                  if (idKey && !seenIds.has(idKey)) {
+                      seenIds.add(idKey);
+                      finalResults.unshift(item);
+                  }
+              }
+          }
 
-          const missingResults = await Promise.all(missingPromises);
-          for (const item of missingResults) {
-              const idKey = item.mediaId;
-              if (idKey && seenIds.has(idKey)) continue;
-              if (idKey) {
-                seenIds.add(idKey);
-                finalResults.unshift(item);
+          // 无 season_id 的条目回退到原流程：请求详情接口完成 md → season_id 转换
+          if (missingWithoutSeason.length > 0) {
+              log("info", `[Bilibili] 从本地 Bangumi-Data 补充 ${missingWithoutSeason.length} 条缺漏记录并请求详情...`);
+
+              const missingPromises = missingWithoutSeason.map(async (m) => {
+                  const mediaInfo = await this._resolveMediaInfo(m.siteId);
+                  const displayTitle = m.titles.find(t => t && t.includes(keyword)) || m.titles[1] || m.title;
+                  const finalTitle = displayTitle + (m.titleSuffix || '');
+
+                  return {
+                    provider: "bilibili",
+                    mediaId: mediaInfo.seasonId || `md${m.siteId}`,
+                    mdId: `md${m.siteId}`,
+                    title: finalTitle,
+                    org_title: m.title,
+                    aliases: [...m.titles],
+                    _displayTitle: finalTitle,
+                    type: m.typeStr,
+                    year: m.begin ? parseInt(m.begin.substring(0, 4)) : null,
+                    imageUrl: mediaInfo.cover,
+                    episodeCount: 0,
+                    isOversea: ['bilibili_hk_mo_tw', 'bilibili_hk_mo', 'bilibili_tw'].includes(m.matchedSiteKey),
+                    isLocalPriority: true
+                  };
+              });
+
+              const missingResults = await Promise.all(missingPromises);
+              for (const item of missingResults) {
+                  const idKey = item.mediaId;
+                  if (idKey && seenIds.has(idKey)) continue;
+                  if (idKey) {
+                    seenIds.add(idKey);
+                    finalResults.unshift(item);
+                  }
               }
           }
       }
@@ -447,6 +483,8 @@ export default class BilibiliSource extends BaseSource {
             if (data.code === 0 && data.result) {
                 // 优先从 main_section 获取分集，兼容 view 和 section 接口
                 rawEpisodes = data.result.main_section?.episodes || data.result.episodes || [];
+                // 从详情接口提取番剧主封面，供搜索结果未提供 imageUrl 时使用
+                if (data.result.cover) rawEpisodes._cover = data.result.cover;
                 if (rawEpisodes.length > 0) break;
             }
         } catch(e) {
@@ -480,6 +518,9 @@ export default class BilibiliSource extends BaseSource {
             link: `https://www.bilibili.com/bangumi/play/ep${ep.id}`
         };
     });
+
+    // 将详情接口封面转移到返回数组（.map() 产生新数组，不会继承原数组属性）
+    if (rawEpisodes._cover) episodes._cover = rawEpisodes._cover;
 
     log("info", `[Bilibili] 获取到 ${episodes.length} 个番剧分集`);
     return episodes;
@@ -553,7 +594,15 @@ export default class BilibiliSource extends BaseSource {
     return [];
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -577,10 +626,33 @@ export default class BilibiliSource extends BaseSource {
     const cnAlias = sourceAnimes.length > 0 ? sourceAnimes[0]._tmdbCnAlias : null;
     smartTitleReplace(sourceAnimes, cnAlias);
 
-    const processPromises = sourceAnimes
-      // 港澳台资源不做严格标题匹配，其他资源根据当前标题或别名池（已包含原标题和 org_title）验证查询匹配度
-      .filter(anime => anime.isOversea || titleMatches(anime.title, queryTitle) || (anime.aliases && anime.aliases.some(alias => titleMatches(alias, queryTitle))))
-      .map(async (anime) => {
+    // 基础标题与季度匹配过滤
+    // 港澳台资源不做严格标题匹配，其他资源根据当前标题或别名池（已包含原标题和 org_title）验证查询匹配度
+    let filteredAnimes = sourceAnimes.filter(anime => 
+        anime.isOversea || 
+        titleMatches(anime.title, queryTitle, querySeason) || 
+        (anime.aliases && anime.aliases.some(alias => titleMatches(alias, queryTitle, querySeason)))
+    );
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const titleToCheck = anime._displayTitle || anime.title;
+        const s = extractSeasonNumberFromAnimeTitle(titleToCheck).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[Bilibili] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    const processPromises = filteredAnimes.map(async (anime) => {
         try {
           let links = [];
 
@@ -631,6 +703,8 @@ export default class BilibiliSource extends BaseSource {
                log("info", `[Bilibili] ${anime.title} 无分集，跳过`);
                return;
              }
+             // 使用详情接口返回的番剧主封面填充搜索结果未提供的 imageUrl
+             if (eps._cover) anime.imageUrl = eps._cover;
              links = eps.map((ep, index) => {
                 let linkUrl = ep.link + `?season_id=${anime.mediaId.substring(2)}`;
                 // 传递区域标记
